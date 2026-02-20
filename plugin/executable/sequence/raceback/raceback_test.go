@@ -34,15 +34,17 @@ import (
 )
 
 type testExec struct {
-	delay   time.Duration
-	resp    *dns.Msg
-	err     error
-	waitCtx bool
+	delay    time.Duration
+	resp     *dns.Msg
+	err      error
+	waitCtx  bool
+	onCancel chan struct{}
 }
 
 func (e *testExec) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	if e.waitCtx {
 		<-ctx.Done()
+		notifyCancel(e.onCancel)
 		return context.Cause(ctx)
 	}
 
@@ -51,6 +53,7 @@ func (e *testExec) Exec(ctx context.Context, qCtx *query_context.Context) error 
 		defer t.Stop()
 		select {
 		case <-ctx.Done():
+			notifyCancel(e.onCancel)
 			return context.Cause(ctx)
 		case <-t.C:
 		}
@@ -63,6 +66,17 @@ func (e *testExec) Exec(ctx context.Context, qCtx *query_context.Context) error 
 		qCtx.SetResponse(e.resp.Copy())
 	}
 	return nil
+}
+
+func notifyCancel(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	default:
+		close(ch)
+	}
 }
 
 func TestRacebackExec(t *testing.T) {
@@ -210,6 +224,28 @@ func TestRacebackInit(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("expected init error when probe_exec tag is invalid")
+	}
+}
+
+func TestRacebackCancelProbeOnLocalDecision(t *testing.T) {
+	canceled := make(chan struct{})
+	rb := &raceback{
+		logger:       zap.NewNop(),
+		probe:        &testExec{waitCtx: true, onCancel: canceled},
+		local:        &testExec{delay: 5 * time.Millisecond, resp: newAResp("1.1.1.1")},
+		timeout:      200 * time.Millisecond,
+		probeMinWait: 20 * time.Millisecond,
+	}
+
+	err := rb.Exec(context.Background(), newQueryContext())
+	if err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+
+	select {
+	case <-canceled:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("probe context was not canceled after local decision")
 	}
 }
 

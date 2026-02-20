@@ -108,12 +108,16 @@ func newRacebackPlugin(bp *coremain.BP, args *Args) (*raceback, error) {
 func (r *raceback) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
+	probeCtx, cancelProbe := context.WithCancel(runCtx)
+	defer cancelProbe()
+	localCtx, cancelLocal := context.WithCancel(runCtx)
+	defer cancelLocal()
 
 	probeCh := make(chan execEvent, 1)
 	localCh := make(chan execEvent, 1)
 
-	go r.runExecutable(runCtx, r.probe, qCtx.Copy(), probeCh)
-	go r.runExecutable(runCtx, r.local, qCtx.Copy(), localCh)
+	go r.runExecutable(probeCtx, r.probe, qCtx.Copy(), probeCh)
+	go r.runExecutable(localCtx, r.local, qCtx.Copy(), localCh)
 
 	var probeEvent *execEvent
 	var localEvent *execEvent
@@ -128,6 +132,7 @@ func (r *raceback) Exec(ctx context.Context, qCtx *query_context.Context) error 
 
 	for {
 		if probeEvent != nil && probeEvent.resp != nil {
+			cancelLocal()
 			qCtx.SetResponse(probeEvent.resp)
 			return nil
 		}
@@ -147,8 +152,10 @@ func (r *raceback) Exec(ctx context.Context, qCtx *query_context.Context) error 
 			}
 
 			if localEvent.err != nil {
+				cancelProbe()
 				return localEvent.err
 			}
+			cancelProbe()
 			qCtx.SetResponse(localEvent.resp)
 			return nil
 		}
@@ -162,13 +169,13 @@ func (r *raceback) Exec(ctx context.Context, qCtx *query_context.Context) error 
 		case e := <-probeRecv:
 			probeEvent = &e
 			probeRecv = nil
-			if e.err != nil {
+			if e.err != nil && !isExpectedCancelErr(e.err) {
 				r.logger.Warn("probe error", qCtx.InfoField(), zap.Error(e.err))
 			}
 		case e := <-localRecv:
 			localEvent = &e
 			localRecv = nil
-			if e.err != nil {
+			if e.err != nil && !isExpectedCancelErr(e.err) {
 				r.logger.Warn("local error", qCtx.InfoField(), zap.Error(e.err))
 			}
 		}
@@ -191,4 +198,8 @@ func stopTimer(t *time.Timer) {
 		default:
 		}
 	}
+}
+
+func isExpectedCancelErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }

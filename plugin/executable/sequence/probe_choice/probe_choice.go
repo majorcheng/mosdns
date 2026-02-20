@@ -117,14 +117,20 @@ func newProbeChoicePlugin(bp *coremain.BP, args *Args) (*probeChoice, error) {
 func (p *probeChoice) Exec(ctx context.Context, qCtx *query_context.Context) error {
 	runCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
+	probeCtx, cancelProbe := context.WithCancel(runCtx)
+	defer cancelProbe()
+	remoteCtx, cancelRemote := context.WithCancel(runCtx)
+	defer cancelRemote()
+	localCtx, cancelLocal := context.WithCancel(runCtx)
+	defer cancelLocal()
 
 	probeCh := make(chan execEvent, 1)
 	remoteCh := make(chan execEvent, 1)
 	localCh := make(chan execEvent, 1)
 
-	go p.runExecutable(runCtx, p.probe, qCtx.Copy(), probeCh)
-	go p.runExecutable(runCtx, p.remote, qCtx.Copy(), remoteCh)
-	go p.runExecutable(runCtx, p.local, qCtx.Copy(), localCh)
+	go p.runExecutable(probeCtx, p.probe, qCtx.Copy(), probeCh)
+	go p.runExecutable(remoteCtx, p.remote, qCtx.Copy(), remoteCh)
+	go p.runExecutable(localCtx, p.local, qCtx.Copy(), localCh)
 
 	var remoteEvent *execEvent
 	var localEvent *execEvent
@@ -141,6 +147,7 @@ func (p *probeChoice) Exec(ctx context.Context, qCtx *query_context.Context) err
 
 	for {
 		if probeSeen && remoteEvent != nil {
+			cancelLocal()
 			if remoteEvent.err != nil {
 				return remoteEvent.err
 			}
@@ -163,8 +170,12 @@ func (p *probeChoice) Exec(ctx context.Context, qCtx *query_context.Context) err
 			}
 
 			if localEvent.err != nil {
+				cancelProbe()
+				cancelRemote()
 				return localEvent.err
 			}
+			cancelProbe()
+			cancelRemote()
 			qCtx.SetResponse(localEvent.resp)
 			return nil
 		}
@@ -177,20 +188,21 @@ func (p *probeChoice) Exec(ctx context.Context, qCtx *query_context.Context) err
 			gateC = nil
 		case e := <-probeRecv:
 			probeSeen = true
+			cancelLocal()
 			probeRecv = nil
-			if e.err != nil {
+			if e.err != nil && !isExpectedCancelErr(e.err) {
 				p.logger.Warn("probe error", qCtx.InfoField(), zap.Error(e.err))
 			}
 		case e := <-remoteRecv:
 			remoteEvent = &e
 			remoteRecv = nil
-			if e.err != nil {
+			if e.err != nil && !isExpectedCancelErr(e.err) {
 				p.logger.Warn("remote error", qCtx.InfoField(), zap.Error(e.err))
 			}
 		case e := <-localRecv:
 			localEvent = &e
 			localRecv = nil
-			if e.err != nil {
+			if e.err != nil && !isExpectedCancelErr(e.err) {
 				p.logger.Warn("local error", qCtx.InfoField(), zap.Error(e.err))
 			}
 		}
@@ -213,4 +225,8 @@ func stopTimer(t *time.Timer) {
 		default:
 		}
 	}
+}
+
+func isExpectedCancelErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
