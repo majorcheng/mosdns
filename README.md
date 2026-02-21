@@ -68,7 +68,6 @@ docker 镜像: [docker hub](https://hub.docker.com/r/irinesistiana/mosdns)
 - `remote_exec` (required)
 - `local_exec` (required)
 - `probe_wait` (optional, 默认 50ms)
-- `timeout` (optional, 默认 300ms)
 
 配置示例:
 
@@ -80,5 +79,4 @@ docker 镜像: [docker hub](https://hub.docker.com/r/irinesistiana/mosdns)
     remote_exec: remote_seq
     local_exec: local_seq
     probe_wait: 50
-    timeout: 300
 ```
