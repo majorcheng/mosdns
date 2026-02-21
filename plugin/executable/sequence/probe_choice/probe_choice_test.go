@@ -39,7 +39,6 @@ type testExec struct {
 	err      error
 	waitCtx  bool
 	onCancel chan struct{}
-	onClose  chan struct{}
 }
 
 func (e *testExec) Exec(ctx context.Context, qCtx *query_context.Context) error {
@@ -80,13 +79,8 @@ func notifyCancel(ch chan struct{}) {
 	}
 }
 
-func (e *testExec) Close(_ context.Context) error {
-	notifyCancel(e.onClose)
-	return nil
-}
-
 func TestProbeChoiceExec(t *testing.T) {
-	newPC := func(probe, remote, local sequence.Executable, probeWaitMs, timeoutMs int) *probeChoice {
+	newPC := func(probe, remote, local sequence.Executable, probeWaitMs int) *probeChoice {
 		return &probeChoice{
 			logger:    zap.NewNop(),
 			probe:     probe,
@@ -110,7 +104,6 @@ func TestProbeChoiceExec(t *testing.T) {
 				&testExec{delay: 30 * time.Millisecond, resp: newAResp("8.8.8.8")},
 				&testExec{delay: 5 * time.Millisecond, resp: newAResp("1.1.1.1")},
 				50,
-				200,
 			),
 			wantAnswer: "8.8.8.8",
 		},
@@ -121,7 +114,6 @@ func TestProbeChoiceExec(t *testing.T) {
 				&testExec{delay: 150 * time.Millisecond, resp: newAResp("8.8.8.8")},
 				&testExec{delay: 20 * time.Millisecond, resp: newAResp("1.1.1.1")},
 				50,
-				220,
 			),
 			wantAnswer: "1.1.1.1",
 		},
@@ -132,7 +124,6 @@ func TestProbeChoiceExec(t *testing.T) {
 				&testExec{delay: 90 * time.Millisecond, resp: newAResp("8.8.8.8")},
 				&testExec{delay: 140 * time.Millisecond, resp: newAResp("1.1.1.1")},
 				50,
-				260,
 			),
 			wantAnswer: "8.8.8.8",
 		},
@@ -143,7 +134,6 @@ func TestProbeChoiceExec(t *testing.T) {
 				&testExec{delay: 20 * time.Millisecond, err: errors.New("remote failed")},
 				&testExec{delay: 80 * time.Millisecond, resp: newAResp("1.1.1.1")},
 				50,
-				200,
 			),
 			wantErr: true,
 		},
@@ -154,7 +144,6 @@ func TestProbeChoiceExec(t *testing.T) {
 				&testExec{delay: 20 * time.Millisecond},
 				&testExec{delay: 80 * time.Millisecond, resp: newAResp("1.1.1.1")},
 				50,
-				200,
 			),
 			wantNil: true,
 		},
@@ -165,7 +154,6 @@ func TestProbeChoiceExec(t *testing.T) {
 				&testExec{delay: 180 * time.Millisecond, resp: newAResp("8.8.8.8")},
 				&testExec{delay: 60 * time.Millisecond, err: errors.New("local failed")},
 				50,
-				240,
 			),
 			wantErr: true,
 		},
@@ -176,7 +164,6 @@ func TestProbeChoiceExec(t *testing.T) {
 				&testExec{waitCtx: true},
 				&testExec{waitCtx: true},
 				50,
-				0,
 			),
 			wantErr: true,
 		},
@@ -258,16 +245,13 @@ func TestProbeChoiceInit(t *testing.T) {
 }
 
 func TestProbeChoiceCancelOtherBranchesOnLocalDecision(t *testing.T) {
-	probeClosed := make(chan struct{})
-	remoteClosed := make(chan struct{})
-	localClosed := make(chan struct{})
 	probeCanceled := make(chan struct{})
 	remoteCanceled := make(chan struct{})
 	pc := &probeChoice{
 		logger:    zap.NewNop(),
-		probe:     &testExec{waitCtx: true, onCancel: probeCanceled, onClose: probeClosed},
-		remote:    &testExec{waitCtx: true, onCancel: remoteCanceled, onClose: remoteClosed},
-		local:     &testExec{delay: 10 * time.Millisecond, resp: newAResp("1.1.1.1"), onClose: localClosed},
+		probe:     &testExec{waitCtx: true, onCancel: probeCanceled},
+		remote:    &testExec{waitCtx: true, onCancel: remoteCanceled},
+		local:     &testExec{delay: 10 * time.Millisecond, resp: newAResp("1.1.1.1")},
 		probeWait: 20 * time.Millisecond,
 	}
 
@@ -287,23 +271,38 @@ func TestProbeChoiceCancelOtherBranchesOnLocalDecision(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("remote context was not canceled after local decision")
 	}
+}
 
-	select {
-	case <-probeClosed:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("probe close was not called")
+func TestProbeChoiceWaitsForSelectedBranch(t *testing.T) {
+	pc := &probeChoice{
+		logger:    zap.NewNop(),
+		probe:     &testExec{delay: 10 * time.Millisecond},
+		remote:    &testExec{delay: 120 * time.Millisecond, resp: newAResp("8.8.8.8")},
+		local:     &testExec{delay: 5 * time.Millisecond, resp: newAResp("1.1.1.1")},
+		probeWait: 50 * time.Millisecond,
 	}
 
-	select {
-	case <-remoteClosed:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("remote close was not called")
+	qCtx := newQueryContext()
+	start := time.Now()
+	err := pc.Exec(context.Background(), qCtx)
+	if err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 110*time.Millisecond {
+		t.Fatalf("Exec() returned too early, elapsed = %v", elapsed)
 	}
 
-	select {
-	case <-localClosed:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("local close was not called")
+	r := qCtx.R()
+	if r == nil || len(r.Answer) == 0 {
+		t.Fatalf("Exec() got empty response")
+	}
+	a, ok := r.Answer[0].(*dns.A)
+	if !ok {
+		t.Fatalf("Exec() got answer type %T", r.Answer[0])
+	}
+	if a.A.String() != "8.8.8.8" {
+		t.Fatalf("Exec() answer = %s, want 8.8.8.8", a.A.String())
 	}
 }
 
