@@ -39,6 +39,7 @@ type testExec struct {
 	err      error
 	waitCtx  bool
 	onCancel chan struct{}
+	onClose  chan struct{}
 }
 
 func (e *testExec) Exec(ctx context.Context, qCtx *query_context.Context) error {
@@ -79,6 +80,11 @@ func notifyCancel(ch chan struct{}) {
 	}
 }
 
+func (e *testExec) Close(_ context.Context) error {
+	notifyCancel(e.onClose)
+	return nil
+}
+
 func TestProbeChoiceExec(t *testing.T) {
 	newPC := func(probe, remote, local sequence.Executable, probeWaitMs, timeoutMs int) *probeChoice {
 		return &probeChoice{
@@ -87,7 +93,6 @@ func TestProbeChoiceExec(t *testing.T) {
 			remote:    remote,
 			local:     local,
 			probeWait: time.Duration(probeWaitMs) * time.Millisecond,
-			timeout:   time.Duration(timeoutMs) * time.Millisecond,
 		}
 	}
 
@@ -165,13 +170,13 @@ func TestProbeChoiceExec(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "timeout when no branch can decide",
+			name: "returns context canceled when no branch can decide",
 			pc: newPC(
 				&testExec{waitCtx: true},
 				&testExec{waitCtx: true},
 				&testExec{waitCtx: true},
 				50,
-				40,
+				0,
 			),
 			wantErr: true,
 		},
@@ -180,7 +185,14 @@ func TestProbeChoiceExec(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			qCtx := newQueryContext()
-			err := tt.pc.Exec(context.Background(), qCtx)
+			runCtx := context.Background()
+			var cancel context.CancelFunc
+			if tt.name == "returns context canceled when no branch can decide" {
+				runCtx, cancel = context.WithTimeout(context.Background(), 40*time.Millisecond)
+				defer cancel()
+			}
+
+			err := tt.pc.Exec(runCtx, qCtx)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("Exec() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -246,15 +258,17 @@ func TestProbeChoiceInit(t *testing.T) {
 }
 
 func TestProbeChoiceCancelOtherBranchesOnLocalDecision(t *testing.T) {
+	probeClosed := make(chan struct{})
+	remoteClosed := make(chan struct{})
+	localClosed := make(chan struct{})
 	probeCanceled := make(chan struct{})
 	remoteCanceled := make(chan struct{})
 	pc := &probeChoice{
 		logger:    zap.NewNop(),
-		probe:     &testExec{waitCtx: true, onCancel: probeCanceled},
-		remote:    &testExec{waitCtx: true, onCancel: remoteCanceled},
-		local:     &testExec{delay: 10 * time.Millisecond, resp: newAResp("1.1.1.1")},
+		probe:     &testExec{waitCtx: true, onCancel: probeCanceled, onClose: probeClosed},
+		remote:    &testExec{waitCtx: true, onCancel: remoteCanceled, onClose: remoteClosed},
+		local:     &testExec{delay: 10 * time.Millisecond, resp: newAResp("1.1.1.1"), onClose: localClosed},
 		probeWait: 20 * time.Millisecond,
-		timeout:   200 * time.Millisecond,
 	}
 
 	err := pc.Exec(context.Background(), newQueryContext())
@@ -272,6 +286,24 @@ func TestProbeChoiceCancelOtherBranchesOnLocalDecision(t *testing.T) {
 	case <-remoteCanceled:
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("remote context was not canceled after local decision")
+	}
+
+	select {
+	case <-probeClosed:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("probe close was not called")
+	}
+
+	select {
+	case <-remoteClosed:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("remote close was not called")
+	}
+
+	select {
+	case <-localClosed:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("local close was not called")
 	}
 }
 

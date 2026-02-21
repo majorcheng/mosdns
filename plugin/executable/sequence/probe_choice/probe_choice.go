@@ -35,7 +35,6 @@ import (
 const PluginType = "probe_choice"
 
 const (
-	defaultTimeout   = time.Millisecond * 300
 	defaultProbeWait = time.Millisecond * 50
 )
 
@@ -48,7 +47,6 @@ type Args struct {
 	RemoteExec string `yaml:"remote_exec"`
 	LocalExec  string `yaml:"local_exec"`
 	ProbeWait  int    `yaml:"probe_wait"`
-	Timeout    int    `yaml:"timeout"`
 }
 
 type probeChoice struct {
@@ -57,7 +55,6 @@ type probeChoice struct {
 	remote    sequence.Executable
 	local     sequence.Executable
 	probeWait time.Duration
-	timeout   time.Duration
 }
 
 type execEvent struct {
@@ -99,29 +96,21 @@ func newProbeChoicePlugin(bp *coremain.BP, args *Args) (*probeChoice, error) {
 	if probeWait <= 0 {
 		probeWait = defaultProbeWait
 	}
-	timeout := time.Duration(args.Timeout) * time.Millisecond
-	if timeout <= 0 {
-		timeout = defaultTimeout
-	}
-
 	return &probeChoice{
 		logger:    bp.L(),
 		probe:     probe,
 		remote:    remote,
 		local:     local,
 		probeWait: probeWait,
-		timeout:   timeout,
 	}, nil
 }
 
 func (p *probeChoice) Exec(ctx context.Context, qCtx *query_context.Context) error {
-	runCtx, cancel := context.WithTimeout(ctx, p.timeout)
-	defer cancel()
-	probeCtx, cancelProbe := context.WithCancel(runCtx)
+	probeCtx, cancelProbe := context.WithCancel(ctx)
 	defer cancelProbe()
-	remoteCtx, cancelRemote := context.WithCancel(runCtx)
+	remoteCtx, cancelRemote := context.WithCancel(ctx)
 	defer cancelRemote()
-	localCtx, cancelLocal := context.WithCancel(runCtx)
+	localCtx, cancelLocal := context.WithCancel(ctx)
 	defer cancelLocal()
 
 	probeCh := make(chan execEvent, 1)
@@ -181,8 +170,8 @@ func (p *probeChoice) Exec(ctx context.Context, qCtx *query_context.Context) err
 		}
 
 		select {
-		case <-runCtx.Done():
-			return context.Cause(runCtx)
+		case <-ctx.Done():
+			return context.Cause(ctx)
 		case <-gateC:
 			gatePassed = true
 			gateC = nil
