@@ -39,6 +39,9 @@ type Context struct {
 	id        uint32
 	startTime time.Time
 
+	// LogBranch identifies a parallel or background execution in request logs.
+	LogBranch string
+
 	// ServerMeta contains some meta info from the server.
 	// It is read-only.
 	ServerMeta ServerMeta
@@ -171,11 +174,22 @@ func (ctx *Context) Copy() *Context {
 	return newCtx
 }
 
+// CopyForBranch copies the context and appends a branch to its log path.
+func (ctx *Context) CopyForBranch(branch string) *Context {
+	d := ctx.Copy()
+	if ctx.LogBranch != "" {
+		branch = ctx.LogBranch + "/" + branch
+	}
+	d.LogBranch = branch
+	return d
+}
+
 // CopyTo deep copies this Context to d.
 // Note that values that stored by StoreValue is not deep-copied.
 func (ctx *Context) CopyTo(d *Context) *Context {
 	d.id = ctx.id
 	d.startTime = ctx.startTime
+	d.LogBranch = ctx.LogBranch
 
 	d.ServerMeta = ctx.ServerMeta
 	d.query = ctx.query.Copy()
@@ -236,6 +250,9 @@ func (ctx *Context) DeleteMark(m uint32) {
 // MarshalLogObject implements zapcore.ObjectMarshaler.
 func (ctx *Context) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 	encoder.AddUint32("uqid", ctx.id)
+	if ctx.LogBranch != "" {
+		encoder.AddString("branch", ctx.LogBranch)
+	}
 
 	if clientAddr := ctx.ServerMeta.ClientAddr; clientAddr.IsValid() {
 		zap.Stringer("client", clientAddr).AddTo(encoder)
@@ -245,11 +262,25 @@ func (ctx *Context) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 	encoder.AddString("qname", question.Name)
 	encoder.AddUint16("qtype", question.Qtype)
 	encoder.AddUint16("qclass", question.Qclass)
+	encoder.AddString("qtype_name", dns.Type(question.Qtype).String())
+	encoder.AddString("qclass_name", dns.Class(question.Qclass).String())
 
-	if r := ctx.resp; r != nil {
-		encoder.AddInt("rcode", r.Rcode)
-	}
 	encoder.AddDuration("elapsed", time.Since(ctx.startTime))
+	return (*ResponseInfo)(ctx.resp).MarshalLogObject(encoder)
+}
+
+// ResponseInfo logs the response being considered, including a missing response.
+type ResponseInfo dns.Msg
+
+func (r *ResponseInfo) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
+	encoder.AddBool("has_resp", r != nil)
+	if r != nil {
+		encoder.AddInt("rcode", r.Rcode)
+		if name, ok := dns.RcodeToString[r.Rcode]; ok {
+			encoder.AddString("rcode_name", name)
+		}
+		encoder.AddInt("answers", len(r.Answer))
+	}
 	return nil
 }
 

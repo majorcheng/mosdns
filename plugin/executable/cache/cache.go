@@ -192,6 +192,9 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 
 	msgKey := getMsgKey(q)
 	if len(msgKey) == 0 { // skip cache
+		if ce := c.logger.Check(zap.DebugLevel, "cache skipped"); ce != nil {
+			ce.Write(qCtx.InfoField(), zap.String("reason", "query is not cacheable"))
+		}
 		return next.ExecNext(ctx, qCtx)
 	}
 
@@ -204,6 +207,15 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 		c.hitTotal.Inc()
 		cachedResp.Id = q.Id // change msg id
 		qCtx.SetResponse(cachedResp)
+	}
+	if ce := c.logger.Check(zap.DebugLevel, "cache lookup"); ce != nil {
+		result := "miss"
+		if lazyHit {
+			result = "stale hit"
+		} else if cachedResp != nil {
+			result = "hit"
+		}
+		ce.Write(qCtx.InfoField(), zap.String("result", result))
 	}
 
 	err := next.ExecNext(ctx, qCtx)
@@ -218,12 +230,14 @@ func (c *Cache) Exec(ctx context.Context, qCtx *query_context.Context, next sequ
 // doLazyUpdate starts a new goroutine to execute next node and update the cache in the background.
 // It has an inner singleflight.Group to de-duplicate same msgKey.
 func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next sequence.ChainWalker) {
-	qCtxCopy := qCtx.Copy()
+	qCtxCopy := qCtx.CopyForBranch(c.logger.Name() + "/refresh")
 	lazyUpdateFunc := func() (any, error) {
 		defer c.lazyUpdateSF.Forget(msgKey)
 		qCtx := qCtxCopy
 
-		c.logger.Debug("start lazy cache update", qCtx.InfoField())
+		if ce := c.logger.Check(zap.DebugLevel, "start lazy cache update"); ce != nil {
+			ce.Write(qCtx.InfoField())
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
 		defer cancel()
 
@@ -237,7 +251,9 @@ func (c *Cache) doLazyUpdate(msgKey string, qCtx *query_context.Context, next se
 			saveRespToCache(msgKey, r, c.backend, c.args.LazyCacheTTL)
 			c.updatedKey.Add(1)
 		}
-		c.logger.Debug("lazy cache updated", qCtx.InfoField())
+		if ce := c.logger.Check(zap.DebugLevel, "lazy cache refresh finished"); ce != nil {
+			ce.Write(qCtx.InfoField(), zap.Error(err))
+		}
 		return nil, nil
 	}
 	c.lazyUpdateSF.DoChan(msgKey, lazyUpdateFunc) // DoChan won't block this goroutine

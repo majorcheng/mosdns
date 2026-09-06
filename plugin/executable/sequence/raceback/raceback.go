@@ -106,6 +106,9 @@ func newRacebackPlugin(bp *coremain.BP, args *Args) (*raceback, error) {
 }
 
 func (r *raceback) Exec(ctx context.Context, qCtx *query_context.Context) error {
+	if ce := r.logger.Check(zap.DebugLevel, "raceback started"); ce != nil {
+		ce.Write(qCtx.InfoField(), zap.Duration("probe_wait", r.probeMinWait), zap.Duration("timeout", r.timeout))
+	}
 	runCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 	probeCtx, cancelProbe := context.WithCancel(runCtx)
@@ -116,8 +119,8 @@ func (r *raceback) Exec(ctx context.Context, qCtx *query_context.Context) error 
 	probeCh := make(chan execEvent, 1)
 	localCh := make(chan execEvent, 1)
 
-	go r.runExecutable(probeCtx, r.probe, qCtx.Copy(), probeCh)
-	go r.runExecutable(localCtx, r.local, qCtx.Copy(), localCh)
+	go r.runExecutable(probeCtx, r.probe, qCtx.CopyForBranch(r.logger.Name()+"/probe"), probeCh)
+	go r.runExecutable(localCtx, r.local, qCtx.CopyForBranch(r.logger.Name()+"/local"), localCh)
 
 	var probeEvent *execEvent
 	var localEvent *execEvent
@@ -132,6 +135,10 @@ func (r *raceback) Exec(ctx context.Context, qCtx *query_context.Context) error 
 
 	for {
 		if probeEvent != nil && probeEvent.resp != nil {
+			if ce := r.logger.Check(zap.DebugLevel, "branch selected"); ce != nil {
+				ce.Write(qCtx.InfoField(), zap.String("selected", "probe"), zap.String("reason", "probe returned a response"),
+					zap.Object("response", (*query_context.ResponseInfo)(probeEvent.resp)), zap.Error(probeEvent.err))
+			}
 			cancelLocal()
 			qCtx.SetResponse(probeEvent.resp)
 			return nil
@@ -151,6 +158,10 @@ func (r *raceback) Exec(ctx context.Context, qCtx *query_context.Context) error 
 				}
 			}
 
+			if ce := r.logger.Check(zap.DebugLevel, "branch selected"); ce != nil {
+				ce.Write(qCtx.InfoField(), zap.String("selected", "local"), zap.String("reason", "probe wait elapsed without a probe response"),
+					zap.Object("response", (*query_context.ResponseInfo)(localEvent.resp)), zap.Error(localEvent.err))
+			}
 			if localEvent.err != nil {
 				cancelProbe()
 				return localEvent.err
@@ -162,8 +173,14 @@ func (r *raceback) Exec(ctx context.Context, qCtx *query_context.Context) error 
 
 		select {
 		case <-runCtx.Done():
+			if ce := r.logger.Check(zap.DebugLevel, "raceback stopped"); ce != nil {
+				ce.Write(qCtx.InfoField(), zap.Error(context.Cause(runCtx)))
+			}
 			return context.Cause(runCtx)
 		case <-minWaitC:
+			if ce := r.logger.Check(zap.DebugLevel, "probe wait elapsed"); ce != nil {
+				ce.Write(qCtx.InfoField())
+			}
 			minWaitPassed = true
 			minWaitC = nil
 		case e := <-probeRecv:
@@ -183,7 +200,13 @@ func (r *raceback) Exec(ctx context.Context, qCtx *query_context.Context) error 
 }
 
 func (r *raceback) runExecutable(ctx context.Context, exec sequence.Executable, qCtx *query_context.Context, ch chan<- execEvent) {
+	if ce := r.logger.Check(zap.DebugLevel, "branch started"); ce != nil {
+		ce.Write(qCtx.InfoField())
+	}
 	err := exec.Exec(ctx, qCtx)
+	if ce := r.logger.Check(zap.DebugLevel, "branch finished"); ce != nil {
+		ce.Write(qCtx.InfoField(), zap.Error(err))
+	}
 	event := execEvent{resp: qCtx.R(), err: err}
 	select {
 	case ch <- event:

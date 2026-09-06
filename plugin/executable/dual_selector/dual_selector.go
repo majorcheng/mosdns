@@ -68,16 +68,25 @@ func (s *Selector) Exec(ctx context.Context, qCtx *query_context.Context, next s
 	if len(q.Question) != 1 { // skip wired query with multiple questions.
 		return next.ExecNext(ctx, qCtx)
 	}
+	parentBranch := qCtx.LogBranch
+	logDecision := func(result, reason string, err error) {
+		if ce := s.L().Check(zap.DebugLevel, "address preference decision"); ce != nil {
+			ce.Write(qCtx.InfoField(), zap.String("preferred_type", dns.Type(s.prefer).String()),
+				zap.String("result", result), zap.String("reason", reason), zap.Error(err))
+		}
+	}
 
 	qtype := q.Question[0].Qtype
 	// skip queries that have other unrelated types.
 	if qtype != dns.TypeA && qtype != dns.TypeAAAA {
+		logDecision("pass", "query type is not A or AAAA", nil)
 		return next.ExecNext(ctx, qCtx)
 	}
 
 	qName := key(q.Question[0].Name)
 	if qtype == s.prefer {
 		err := next.ExecNext(ctx, qCtx)
+		logDecision("pass", "query uses the preferred type", err)
 		if err != nil {
 			return err
 		}
@@ -95,11 +104,12 @@ func (s *Selector) Exec(ctx context.Context, qCtx *query_context.Context, next s
 		// right away.
 		r := dnsutils.GenEmptyReply(q, dns.RcodeSuccess)
 		qCtx.SetResponse(r)
+		logDecision("suppress", "preferred type found in cache", nil)
 		return nil
 	}
 
 	// async check whether domain has the preferred type
-	qCtxPreferred := qCtx.Copy()
+	qCtxPreferred := qCtx.CopyForBranch(s.L().Name() + "/reference")
 	qCtxPreferred.Q().Question[0].Qtype = s.prefer
 
 	ddl, cacheOk := ctx.Deadline()
@@ -113,7 +123,13 @@ func (s *Selector) Exec(ctx context.Context, qCtx *query_context.Context, next s
 		qCtx := qCtxPreferred
 		ctx, cancel := context.WithDeadline(context.Background(), ddl)
 		defer cancel()
+		if ce := s.L().Check(zap.DebugLevel, "branch started"); ce != nil {
+			ce.Write(qCtx.InfoField())
+		}
 		err := next.ExecNext(ctx, qCtx)
+		if ce := s.L().Check(zap.DebugLevel, "branch finished"); ce != nil {
+			ce.Write(qCtx.InfoField(), zap.Error(err))
+		}
 		if err != nil {
 			s.L().Warn("reference query routine err", qCtx.InfoField(), zap.Error(err))
 			close(shouldPass)
@@ -130,38 +146,53 @@ func (s *Selector) Exec(ctx context.Context, qCtx *query_context.Context, next s
 
 	// start original query goroutine
 	doneChan := make(chan error, 1)
-	qCtxOrg := qCtx.Copy()
+	qCtxOrg := qCtx.CopyForBranch(s.L().Name() + "/original")
 	go func() {
 		qCtx := qCtxOrg
 		ctx, cancel := context.WithDeadline(context.Background(), ddl)
 		defer cancel()
-		doneChan <- next.ExecNext(ctx, qCtx)
+		if ce := s.L().Check(zap.DebugLevel, "branch started"); ce != nil {
+			ce.Write(qCtx.InfoField())
+		}
+		err := next.ExecNext(ctx, qCtx)
+		if ce := s.L().Check(zap.DebugLevel, "branch finished"); ce != nil {
+			ce.Write(qCtx.InfoField(), zap.Error(err))
+		}
+		doneChan <- err
 	}()
 
 	select {
 	case <-ctx.Done():
+		logDecision("stop", "request context ended", context.Cause(ctx))
 		return context.Cause(ctx)
 	case <-shouldBlock: // Domain has preferred type. Block this type now.
 		r := dnsutils.GenEmptyReply(q, dns.RcodeSuccess)
 		qCtx.SetResponse(r)
+		logDecision("suppress", "preferred type has an answer", nil)
 		return nil
 	case err := <-doneChan: // The original query finished. Waiting for preferred type check.
 		waitTimeoutTimer := pool.GetTimer(referenceWaitTimeout)
 		defer pool.ReleaseTimer(waitTimeoutTimer)
 		select {
 		case <-ctx.Done():
+			logDecision("stop", "request context ended", context.Cause(ctx))
 			return context.Cause(ctx)
 		case <-shouldBlock:
 			r := dnsutils.GenEmptyReply(q, dns.RcodeSuccess)
 			qCtx.SetResponse(r)
+			logDecision("suppress", "preferred type has an answer", nil)
 			return nil
 		case <-shouldPass:
 			*qCtx = *qCtxOrg // replace qCtx
+			qCtx.LogBranch = parentBranch
+			logDecision("pass", "reference query did not require suppression", err)
 			return err
 		case <-waitTimeoutTimer.C:
 			// We have been waiting the reference query for too long.
 			// Something may go wrong. We accept the original reply.
 			*qCtx = *qCtxOrg
+			qCtx.LogBranch = parentBranch
+			logDecision("pass", "reference wait elapsed", err)
 			return err
 		}
 	}

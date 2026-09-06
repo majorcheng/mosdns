@@ -95,11 +95,17 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 
 	qCtx := query_context.NewContext(q)
 	qCtx.ServerMeta = serverMeta
+	if ce := h.opts.Logger.Check(zap.DebugLevel, "query received"); ce != nil {
+		ce.Write(qCtx.InfoField())
+	}
 
 	// exec entry
 	err := h.opts.Entry.Exec(ctx, qCtx)
+	entryErr := err
+	reason := "entry response"
 	var resp *dns.Msg
 	if err != nil {
+		reason = "entry failed"
 		h.opts.Logger.Warn("entry err", qCtx.InfoField(), zap.Error(err))
 		resp = new(dns.Msg)
 		resp.SetReply(q)
@@ -109,6 +115,7 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 	}
 
 	if resp == nil {
+		reason = "entry returned no response"
 		resp = new(dns.Msg)
 		resp.SetReply(q)
 		resp.Rcode = dns.RcodeRefused
@@ -130,6 +137,10 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 	if err != nil {
 		h.opts.Logger.Error("internal err: failed to pack resp msg", qCtx.InfoField(), zap.Error(err))
 		return nil
+	}
+	if ce := h.opts.Logger.Check(zap.DebugLevel, "response ready"); ce != nil {
+		ce.Write(qCtx.InfoField(), zap.Object("response", (*query_context.ResponseInfo)(resp)),
+			zap.String("reason", reason), zap.Bool("truncated", resp.Truncated), zap.Int("bytes", len(*payload)), zap.Error(entryErr))
 	}
 	return payload
 }

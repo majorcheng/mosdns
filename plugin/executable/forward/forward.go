@@ -254,8 +254,18 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 	}
 
 	type res struct {
-		r   *dns.Msg
-		err error
+		r        *dns.Msg
+		err      error
+		upstream int
+	}
+
+	debug := f.logger.Core().Enabled(zap.DebugLevel)
+	logger := f.logger
+	if debug {
+		question := qCtx.QQuestion()
+		// Capture immutable fields before upstream goroutines outlive this context.
+		logger = logger.With(zap.Uint32("uqid", qCtx.Id()), zap.String("branch", qCtx.LogBranch),
+			zap.String("qname", question.Name), zap.String("qtype_name", dns.Type(question.Qtype).String()))
 	}
 
 	resChan := make(chan res)
@@ -264,13 +274,19 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 
 	r := rand.IntN(len(us))
 	for i := 0; i < concurrent; i++ {
-		u := us[(r+i)%len(us)]
+		idx := (r + i) % len(us)
+		u := us[idx]
 		qc := copyPayload(queryPayload)
-		go func(uqid uint32, question dns.Question) {
+		go func(uqid uint32, question dns.Question, branch string) {
 			defer pool.ReleaseBuf(qc)
 			// Give each upstream a fixed timeout to finish the query.
 			upstreamCtx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 			defer cancel()
+			var start time.Time
+			if debug {
+				start = time.Now()
+				logger.Debug("upstream query started", zap.Int("upstream_index", idx), zap.String("upstream", u.cfg.Tag))
+			}
 
 			var r *dns.Msg
 			respPayload, err := u.ExchangeContext(upstreamCtx, *qc)
@@ -278,6 +294,7 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 				f.logger.Warn(
 					"upstream error",
 					zap.Uint32("uqid", uqid),
+					zap.String("branch", branch),
 					zap.String("qname", question.Name),
 					zap.Uint16("qclass", question.Qclass),
 					zap.Uint16("qtype", question.Qtype),
@@ -292,11 +309,19 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 					r = nil
 				}
 			}
-			select {
-			case resChan <- res{r: r, err: err}:
-			case <-done:
+			if debug {
+				logger.Debug("upstream query finished", zap.Int("upstream_index", idx), zap.String("upstream", u.cfg.Tag),
+					zap.Object("response", (*query_context.ResponseInfo)(r)), zap.Duration("duration", time.Since(start)), zap.Error(err))
 			}
-		}(qCtx.Id(), qCtx.QQuestion())
+			select {
+			case resChan <- res{r: r, err: err, upstream: idx}:
+			case <-done:
+				if debug {
+					logger.Debug("upstream result ignored", zap.Int("upstream_index", idx), zap.String("upstream", u.cfg.Tag),
+						zap.String("reason", "forward already returned"))
+				}
+			}
+		}(qCtx.Id(), qCtx.QQuestion(), qCtx.LogBranch)
 	}
 
 	for i := 0; i < concurrent; i++ {
@@ -309,10 +334,21 @@ func (f *Forward) exchange(ctx context.Context, qCtx *query_context.Context, us 
 
 			// Retry until the last
 			if i < concurrent-1 && r.Rcode != dns.RcodeSuccess && r.Rcode != dns.RcodeNameError {
+				if debug {
+					logger.Debug("upstream response skipped", zap.Int("upstream_index", res.upstream), zap.String("upstream", us[res.upstream].cfg.Tag),
+						zap.Object("response", (*query_context.ResponseInfo)(r)), zap.String("reason", "waiting for a successful or NXDOMAIN response"))
+				}
 				continue
+			}
+			if debug {
+				logger.Debug("upstream response selected", zap.Int("upstream_index", res.upstream), zap.String("upstream", us[res.upstream].cfg.Tag),
+					zap.Object("response", (*query_context.ResponseInfo)(r)))
 			}
 			return r, nil
 		case <-ctx.Done():
+			if debug {
+				logger.Debug("forward canceled", zap.Error(context.Cause(ctx)))
+			}
 			return nil, context.Cause(ctx)
 		}
 	}

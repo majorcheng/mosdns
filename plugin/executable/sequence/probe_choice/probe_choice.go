@@ -106,6 +106,9 @@ func newProbeChoicePlugin(bp *coremain.BP, args *Args) (*probeChoice, error) {
 }
 
 func (p *probeChoice) Exec(ctx context.Context, qCtx *query_context.Context) error {
+	if ce := p.logger.Check(zap.DebugLevel, "probe choice started"); ce != nil {
+		ce.Write(qCtx.InfoField(), zap.Duration("probe_wait", p.probeWait))
+	}
 	probeCtx, cancelProbe := context.WithCancel(ctx)
 	defer cancelProbe()
 	remoteCtx, cancelRemote := context.WithCancel(ctx)
@@ -117,9 +120,9 @@ func (p *probeChoice) Exec(ctx context.Context, qCtx *query_context.Context) err
 	remoteCh := make(chan execEvent, 1)
 	localCh := make(chan execEvent, 1)
 
-	go p.runExecutable(probeCtx, p.probe, qCtx.Copy(), probeCh)
-	go p.runExecutable(remoteCtx, p.remote, qCtx.Copy(), remoteCh)
-	go p.runExecutable(localCtx, p.local, qCtx.Copy(), localCh)
+	go p.runExecutable(probeCtx, p.probe, qCtx.CopyForBranch(p.logger.Name()+"/probe"), probeCh)
+	go p.runExecutable(remoteCtx, p.remote, qCtx.CopyForBranch(p.logger.Name()+"/remote"), remoteCh)
+	go p.runExecutable(localCtx, p.local, qCtx.CopyForBranch(p.logger.Name()+"/local"), localCh)
 
 	var remoteEvent *execEvent
 	var localEvent *execEvent
@@ -136,6 +139,10 @@ func (p *probeChoice) Exec(ctx context.Context, qCtx *query_context.Context) err
 
 	for {
 		if probeSeen && remoteEvent != nil {
+			if ce := p.logger.Check(zap.DebugLevel, "branch selected"); ce != nil {
+				ce.Write(qCtx.InfoField(), zap.String("selected", "remote"), zap.String("reason", "probe returned feedback"),
+					zap.Object("response", (*query_context.ResponseInfo)(remoteEvent.resp)), zap.Error(remoteEvent.err))
+			}
 			cancelLocal()
 			if remoteEvent.err != nil {
 				return remoteEvent.err
@@ -158,6 +165,10 @@ func (p *probeChoice) Exec(ctx context.Context, qCtx *query_context.Context) err
 				}
 			}
 
+			if ce := p.logger.Check(zap.DebugLevel, "branch selected"); ce != nil {
+				ce.Write(qCtx.InfoField(), zap.String("selected", "local"), zap.String("reason", "probe wait elapsed without feedback"),
+					zap.Object("response", (*query_context.ResponseInfo)(localEvent.resp)), zap.Error(localEvent.err))
+			}
 			if localEvent.err != nil {
 				cancelProbe()
 				cancelRemote()
@@ -171,8 +182,14 @@ func (p *probeChoice) Exec(ctx context.Context, qCtx *query_context.Context) err
 
 		select {
 		case <-ctx.Done():
+			if ce := p.logger.Check(zap.DebugLevel, "probe choice stopped"); ce != nil {
+				ce.Write(qCtx.InfoField(), zap.Error(context.Cause(ctx)))
+			}
 			return context.Cause(ctx)
 		case <-gateC:
+			if ce := p.logger.Check(zap.DebugLevel, "probe wait elapsed"); ce != nil {
+				ce.Write(qCtx.InfoField(), zap.Bool("probe_seen", probeSeen))
+			}
 			gatePassed = true
 			gateC = nil
 		case e := <-probeRecv:
@@ -199,7 +216,13 @@ func (p *probeChoice) Exec(ctx context.Context, qCtx *query_context.Context) err
 }
 
 func (p *probeChoice) runExecutable(ctx context.Context, exec sequence.Executable, qCtx *query_context.Context, ch chan<- execEvent) {
+	if ce := p.logger.Check(zap.DebugLevel, "branch started"); ce != nil {
+		ce.Write(qCtx.InfoField())
+	}
 	err := exec.Exec(ctx, qCtx)
+	if ce := p.logger.Check(zap.DebugLevel, "branch finished"); ce != nil {
+		ce.Write(qCtx.InfoField(), zap.Error(err))
+	}
 	event := execEvent{resp: qCtx.R(), err: err}
 	select {
 	case ch <- event:

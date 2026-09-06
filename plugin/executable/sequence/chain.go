@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"go.uber.org/zap"
 	"io"
 )
 
@@ -34,6 +35,9 @@ type ChainNode struct {
 	// In case both are set. E is preferred.
 	E  Executable
 	RE RecursiveExecutable
+
+	logger     *zap.Logger
+	conditions []string
 }
 
 type ChainWalker struct {
@@ -55,13 +59,20 @@ func (w *ChainWalker) ExecNext(ctx context.Context, qCtx *query_context.Context)
 checkMatchesLoop:
 	for p < len(w.chain) {
 		n := w.chain[p]
+		debug := n.logger != nil && n.logger.Core().Enabled(zap.DebugLevel)
 
-		for _, match := range n.Matches {
+		for mi, match := range n.Matches {
 			ok, err := match.Match(ctx, qCtx)
+			if debug {
+				n.logger.Debug("condition evaluated", qCtx.InfoField(), zap.String("condition", n.conditions[mi]), zap.Bool("matched", ok), zap.Error(err))
+			}
 			if err != nil {
 				return err
 			}
 			if !ok {
+				if debug {
+					n.logger.Debug("rule skipped", qCtx.InfoField(), zap.String("reason", "condition did not match"))
+				}
 				// Skip this node if condition was not matched.
 				p++
 				continue checkMatchesLoop
@@ -69,9 +80,16 @@ checkMatchesLoop:
 		}
 
 		// Exec rules' executables in loop, or in stack if it is a recursive executable.
+		if debug {
+			n.logger.Debug("rule executing", qCtx.InfoField())
+		}
 		switch {
 		case n.E != nil:
-			if err := n.E.Exec(ctx, qCtx); err != nil {
+			err := n.E.Exec(ctx, qCtx)
+			if debug {
+				n.logger.Debug("rule returned", qCtx.InfoField(), zap.Error(err))
+			}
+			if err != nil {
 				return err
 			}
 			p++
@@ -82,7 +100,11 @@ checkMatchesLoop:
 				chain:    w.chain,
 				jumpBack: w.jumpBack,
 			}
-			return n.RE.Exec(ctx, qCtx, next)
+			err := n.RE.Exec(ctx, qCtx, next)
+			if debug {
+				n.logger.Debug("rule returned", qCtx.InfoField(), zap.Error(err))
+			}
+			return err
 		default:
 			panic("n cannot be executed")
 		}
@@ -100,13 +122,22 @@ func (w *ChainWalker) nop() bool {
 	return w.p >= len(w.chain)
 }
 
-func (s *Sequence) buildChain(bq BQ, rs []RuleConfig) error {
+func (s *Sequence) buildChain(bq BQ, rs []RuleArgs) error {
 	c := make([]*ChainNode, 0, len(rs))
 	for ri, r := range rs {
-		n, err := s.newNode(bq, r, ri)
+		rc := parseArgs(r)
+		n, err := s.newNode(bq, rc, ri)
 		if err != nil {
 			return fmt.Errorf("failed to init rule #%d, %w", ri, err)
 		}
+		exec := rc.Type
+		if rc.Tag != "" {
+			exec = "$" + rc.Tag
+		} else if rc.Args != "" && (rc.Type == "jump" || rc.Type == "goto" || rc.Type == "reject") {
+			exec += " " + rc.Args
+		}
+		n.logger = bq.L().With(zap.Int("rule", ri), zap.String("exec", exec))
+		n.conditions = r.Matches
 		c = append(c, n)
 	}
 	s.chain = c

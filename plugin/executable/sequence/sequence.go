@@ -60,11 +60,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 func NewSequence(bq BQ, ra []RuleArgs) (*Sequence, error) {
 	s := &Sequence{}
 
-	var rc []RuleConfig
-	for _, ra := range ra {
-		rc = append(rc, parseArgs(ra))
-	}
-	if err := s.buildChain(bq, rc); err != nil {
+	if err := s.buildChain(bq, ra); err != nil {
 		_ = s.Close()
 		return nil, err
 	}
