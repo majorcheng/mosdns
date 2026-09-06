@@ -1,0 +1,10 @@
+# mosdns keeps the log file open; copytruncate avoids requiring a service restart.
+/var/log/mosdns.log {
+    daily
+    rotate 14
+    maxsize 100M
+    missingok
+    notifempty
+    compress
+    copytruncate
+}
